@@ -3,7 +3,8 @@
  * See LICENSE.md in the project root for license terms and full copyright notice.
  *--------------------------------------------------------------------------------------------*/
 
-import { useActiveIModelConnection } from "@itwin/appui-react";
+import { useActiveIModelConnection, useActiveViewport } from "@itwin/appui-react";
+import { Id64 } from "@itwin/core-bentley";
 import { IModelApp } from "@itwin/core-frontend";
 import { MappingsClient } from "@itwin/grouping-mapping-widget";
 import {
@@ -13,6 +14,7 @@ import {
   type ODataItem,
   type ODataTable,
 } from "@itwin/insights-client";
+import { selectionStorage } from "../selectionStorage";
 import { useEffect, useState } from "react";
 
 const mappingsClient = new MappingsClient();
@@ -22,6 +24,58 @@ const odataClient = new ODataClient();
 interface MappingOption {
   id: string;
   name: string;
+}
+
+const SELECTION_SOURCE = "ODataPanel";
+const ELEMENT_ID_FIELD_CANDIDATES = [
+  "ECInstanceId",
+  "ecinstanceid",
+  "ElementId",
+  "elementid",
+  "ECInstance ID",
+  "Element ID",
+  "Id",
+  "id",
+] as const;
+
+function escapeCsvValue(value: unknown): string {
+  const text = String(value ?? "");
+  const escaped = text.replaceAll("\"", "\"\"");
+  return /[",\n\r]/.test(escaped) ? `"${escaped}"` : escaped;
+}
+
+function sanitizeFileNamePart(value: string): string {
+  return value.trim().replace(/[^a-z0-9-_]+/gi, "-").replace(/-+/g, "-").replace(/^-|-$/g, "") || "odata-report";
+}
+
+function findElementIdField(columns: string[], rows: ODataEntityValue[]): string | undefined {
+  for (const candidate of ELEMENT_ID_FIELD_CANDIDATES) {
+    if (!columns.includes(candidate)) {
+      continue;
+    }
+
+    const hasValidValue = rows.some((row) => {
+      const value = row[candidate];
+      return typeof value === "string" && Id64.isValidId64(value);
+    });
+
+    if (hasValidValue) {
+      return candidate;
+    }
+  }
+
+  return columns.find((column) =>
+    rows.some((row) => typeof row[column] === "string" && Id64.isValidId64(row[column] as string)),
+  );
+}
+
+function getRowElementId(row: ODataEntityValue, elementIdField: string | undefined): string | undefined {
+  if (!elementIdField) {
+    return undefined;
+  }
+
+  const value = row[elementIdField];
+  return typeof value === "string" && Id64.isValidId64(value) ? value : undefined;
 }
 
 async function getAccessToken(): Promise<string> {
@@ -35,6 +89,7 @@ async function getAccessToken(): Promise<string> {
 
 export function ODataPanel() {
   const iModel = useActiveIModelConnection();
+  const activeViewport = useActiveViewport();
 
   const [mappings, setMappings] = useState<MappingOption[]>([]);
   const [selectedMappingId, setSelectedMappingId] = useState("");
@@ -44,8 +99,20 @@ export function ODataPanel() {
   const [selectedItemUrl, setSelectedItemUrl] = useState("");
   const [entities, setEntities] = useState<ODataEntityValue[]>([]);
   const [columns, setColumns] = useState<string[]>([]);
+  const [selectedElementIds, setSelectedElementIds] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const elementIdField = findElementIdField(columns, entities);
+  const selectableElementIds = entities.flatMap((row) => {
+    const rowElementId = getRowElementId(row, elementIdField);
+    return rowElementId ? [rowElementId] : [];
+  });
+  const allSelectableRowsSelected = selectableElementIds.length > 0 && selectableElementIds.every((id) => selectedElementIds.includes(id));
+  const exportRows = entities.filter((row) => {
+    const rowElementId = getRowElementId(row, elementIdField);
+    return rowElementId ? selectedElementIds.includes(rowElementId) : false;
+  });
 
   // Fetch mappings when iModel changes
   useEffect(() => {
@@ -89,6 +156,7 @@ export function ODataPanel() {
     setSelectedItemUrl("");
     setEntities([]);
     setColumns([]);
+    setSelectedElementIds([]);
 
     const run = async () => {
       setLoading(true);
@@ -155,6 +223,7 @@ export function ODataPanel() {
     let cancelled = false;
     setEntities([]);
     setColumns([]);
+    setSelectedElementIds([]);
 
     const run = async () => {
       setLoading(true);
@@ -183,6 +252,63 @@ export function ODataPanel() {
   if (!iModel) {
     return <div style={styles.message}>No active iModel.</div>;
   }
+
+  const syncSelection = async (nextSelectedElementIds: string[]) => {
+    selectionStorage.replaceSelection({
+      imodelKey: iModel.key,
+      source: SELECTION_SOURCE,
+      selectables: nextSelectedElementIds.map((id) => ({ className: "BisCore:Element", id })),
+    });
+
+    setSelectedElementIds(nextSelectedElementIds);
+
+    if (nextSelectedElementIds.length === 0) {
+      return;
+    }
+
+    await activeViewport?.zoomToElements(nextSelectedElementIds);
+  };
+
+  const handleRowSelectionChange = (row: ODataEntityValue, checked: boolean) => {
+    const rowElementId = getRowElementId(row, elementIdField);
+    if (!rowElementId) {
+      return;
+    }
+
+    const nextSelectedElementIds = checked
+      ? [...new Set([...selectedElementIds, rowElementId])]
+      : selectedElementIds.filter((id) => id !== rowElementId);
+
+    void syncSelection(nextSelectedElementIds);
+  };
+
+  const handleExportCsv = () => {
+    if (columns.length === 0 || exportRows.length === 0) {
+      return;
+    }
+
+    const csvLines = [
+      columns.map((column) => escapeCsvValue(column)).join(","),
+      ...exportRows.map((row) => columns.map((column) => escapeCsvValue(row[column])).join(",")),
+    ];
+
+    const csvBlob = new Blob([csvLines.join("\r\n")], { type: "text/csv;charset=utf-8;" });
+    const downloadUrl = URL.createObjectURL(csvBlob);
+    const link = document.createElement("a");
+    const tableName = sanitizeFileNamePart(selectedItemUrl || "odata-report");
+    const scopeName = allSelectableRowsSelected ? "all-rows" : "selected-rows";
+
+    link.href = downloadUrl;
+    link.download = `${tableName}-${scopeName}.csv`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(downloadUrl);
+  };
+
+  const handleSelectAllChange = (checked: boolean) => {
+    void syncSelection(checked ? selectableElementIds : []);
+  };
 
   return (
     <div style={styles.container}>
@@ -222,10 +348,39 @@ export function ODataPanel() {
       {error && <div style={styles.error}>{error}</div>}
 
       {entities.length > 0 && columns.length > 0 && (
+        <div style={styles.exportControls}>
+          <label style={styles.exportToggleLabel}>
+            <input
+              type="checkbox"
+              checked={allSelectableRowsSelected}
+              onChange={(e) => handleSelectAllChange(e.target.checked)}
+              disabled={!elementIdField || selectableElementIds.length === 0}
+            />
+            Select all
+          </label>
+          <button
+            type="button"
+            style={styles.exportButton}
+            onClick={handleExportCsv}
+            disabled={exportRows.length === 0}
+          >
+            Export CSV
+          </button>
+        </div>
+      )}
+
+      {selectedItemUrl && !loading && entities.length > 0 && !elementIdField && (
+        <div style={styles.message}>
+          No selectable element id column was found in this report table.
+        </div>
+      )}
+
+      {entities.length > 0 && columns.length > 0 && (
         <div style={styles.tableWrapper}>
           <table style={styles.table}>
             <thead>
               <tr>
+                {elementIdField && <th style={styles.checkboxHeader}>Select</th>}
                 {columns.map((col) => (
                   <th key={col} style={styles.th}>{col}</th>
                 ))}
@@ -234,6 +389,17 @@ export function ODataPanel() {
             <tbody>
               {entities.map((row, i) => (
                 <tr key={i} style={i % 2 === 0 ? styles.trEven : styles.trOdd}>
+                  {elementIdField && (
+                    <td style={styles.checkboxCell}>
+                      <input
+                        type="checkbox"
+                        aria-label={`Select row ${i + 1}`}
+                        checked={selectedElementIds.includes(getRowElementId(row, elementIdField) ?? "")}
+                        onChange={(e) => handleRowSelectionChange(row, e.target.checked)}
+                        disabled={!getRowElementId(row, elementIdField)}
+                      />
+                    </td>
+                  )}
                   {columns.map((col) => (
                     <td key={col} style={styles.td}>{String(row[col] ?? "")}</td>
                   ))}
@@ -290,6 +456,27 @@ const styles = {
     borderRadius: "3px",
     border: "1px solid var(--iui-color-border-negative, #f99)",
   },
+  exportControls: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: "8px",
+    flexWrap: "wrap" as const,
+  },
+  exportToggleLabel: {
+    display: "flex",
+    alignItems: "center",
+    gap: "6px",
+    color: "var(--iui-color-text, #333)",
+  },
+  exportButton: {
+    padding: "4px 10px",
+    border: "1px solid var(--iui-color-border, #ccc)",
+    borderRadius: "3px",
+    backgroundColor: "var(--iui-color-background, #fff)",
+    color: "var(--iui-color-text, #333)",
+    cursor: "pointer",
+  },
   tableWrapper: {
     flex: 1,
     overflow: "auto",
@@ -308,6 +495,16 @@ const styles = {
     position: "sticky" as const,
     top: 0,
   },
+  checkboxHeader: {
+    textAlign: "center" as const,
+    padding: "4px 8px",
+    backgroundColor: "var(--iui-color-background-backdrop, #f0f0f0)",
+    border: "1px solid var(--iui-color-border, #ddd)",
+    whiteSpace: "nowrap" as const,
+    position: "sticky" as const,
+    top: 0,
+    width: "56px",
+  },
   td: {
     padding: "3px 8px",
     border: "1px solid var(--iui-color-border, #eee)",
@@ -315,6 +512,12 @@ const styles = {
     overflow: "hidden",
     textOverflow: "ellipsis",
     whiteSpace: "nowrap" as const,
+  },
+  checkboxCell: {
+    padding: "3px 8px",
+    border: "1px solid var(--iui-color-border, #eee)",
+    textAlign: "center" as const,
+    width: "56px",
   },
   trEven: {
     backgroundColor: "var(--iui-color-background, #fff)",
