@@ -5,7 +5,6 @@
 
 import {
   Viewer,
-  ViewerContentToolsProvider,
   ViewerNavigationToolsProvider,
   ViewerPerformance,
   ViewerStatusbarItemsProvider,
@@ -13,10 +12,11 @@ import {
 import {
   FitViewTool,
   IModelApp,
+  IModelConnection,
   type ScreenViewport,
   StandardViewId,
 } from "@itwin/core-frontend";
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
 import { TreeWidget } from "@itwin/tree-widget-react";
 import { PropertyGridManager } from "@itwin/property-grid-react";
 import {
@@ -29,6 +29,7 @@ import { odataPanelProvider, propertyGridUiProvider, treeWidgetUiProvider } from
 import { useAuthorizationContext } from "./Authorization";
 import { GroupingMappingProvider, GroupingMappingWidget } from "@itwin/grouping-mapping-widget";
 import { ReportsConfigProvider, ReportsConfigWidget } from "@itwin/reports-config-widget-react";
+import { ViewerActionRail } from "./ViewerActionRail";
 
 interface AppProps {
   iTwinId: string;
@@ -38,6 +39,7 @@ interface AppProps {
 
 export function App({ iTwinId, iModelId, changesetId }: AppProps) {
   const { client: authClient } = useAuthorizationContext();
+  const [isViewerReady, setIsViewerReady] = useState(false);
 
   const onIModelAppInit = useCallback(async () => {
     // iModel now initialized
@@ -47,40 +49,44 @@ export function App({ iTwinId, iModelId, changesetId }: AppProps) {
     await GroupingMappingWidget.initialize();
     await ReportsConfigWidget.initialize(IModelApp.localization);
     MeasurementActionToolbar.setDefaultActionProvider();
+    setIsViewerReady(true);
+  }, []);
+
+  const onIModelConnected = useCallback((_iModel: IModelConnection) => {
+    void IModelApp.quantityFormatter.setActiveUnitSystem("metric", true);
   }, []);
 
   return (
-    <Viewer
-      iTwinId={iTwinId}
-      iModelId={iModelId}
-      changeSetId={changesetId}
-      authClient={authClient}
-      viewCreatorOptions={viewCreatorOptions}
-      enablePerformanceMonitors={true} // see description in the README (https://www.npmjs.com/package/@itwin/web-viewer-react)
-      onIModelAppInit={onIModelAppInit}
-      mapLayerOptions={{
-        BingMaps: {
-          key: "key",
-          value: import.meta.env.IMJS_BING_MAPS_KEY ?? "",
-        },
-      }}
-      uiProviders={[
-        new ViewerNavigationToolsProvider(),
-        new ViewerContentToolsProvider({
-          vertical: {
-            measureGroup: false,
+    <div className="viewer-shell">
+      <Viewer
+        iTwinId={iTwinId}
+        iModelId={iModelId}
+        changeSetId={changesetId}
+        authClient={authClient}
+        viewCreatorOptions={viewCreatorOptions}
+        enablePerformanceMonitors={true} // see description in the README (https://www.npmjs.com/package/@itwin/web-viewer-react)
+        onIModelAppInit={onIModelAppInit}
+        onIModelConnected={onIModelConnected}
+        mapLayerOptions={{
+          BingMaps: {
+            key: "key",
+            value: import.meta.env.IMJS_BING_MAPS_KEY ?? "",
           },
-        }),
-        new ViewerStatusbarItemsProvider(),
-        new MeasureToolsUiItemsProvider(),
-        new GroupingMappingProvider(),
-        new ReportsConfigProvider(),
-        odataPanelProvider,
-        treeWidgetUiProvider,
-        propertyGridUiProvider,
-      ]}
-      selectionStorage={selectionStorage}
-    />
+        }}
+        uiProviders={[
+          new ViewerNavigationToolsProvider(),
+          new ViewerStatusbarItemsProvider(),
+          new MeasureToolsUiItemsProvider(),
+          new GroupingMappingProvider(),
+          new ReportsConfigProvider(),
+          odataPanelProvider,
+          treeWidgetUiProvider,
+          propertyGridUiProvider,
+        ]}
+        selectionStorage={selectionStorage}
+      />
+      {isViewerReady ? <ViewerActionRail /> : null}
+    </div>
   );
 }
 
